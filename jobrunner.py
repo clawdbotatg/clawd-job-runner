@@ -145,7 +145,7 @@ class JobRunner:
         if flags.get("output_modality"):
             for m in flags["output_modality"]:
                 output_mods.add(m)
-        elif any(kw in task_lower for kw in ["generate image", "create image", "draw ", "make an image", "pixel art", "generate a picture"]):
+        elif any(kw in task_lower for kw in ["generate image", "generate an image", "create image", "draw ", "make an image", "pixel art", "generate a picture", "create a picture", "an image of", "a picture of"]):
             output_mods.add("image")
 
         # Preference boosts
