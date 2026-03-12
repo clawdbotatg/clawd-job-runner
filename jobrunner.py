@@ -50,6 +50,16 @@ IMAGE_OUTPUT_KEYWORDS = [
     "design a logo", "make a poster", "generate art", "create art",
     "image of", "picture of", "photo of",
 ]
+VIDEO_OUTPUT_KEYWORDS = [
+    "create a video", "generate a video", "make a video", "produce a video",
+    "animate", "create an animation", "generate an animation", "make an animation",
+    "create a clip", "generate a clip", "render a video", "video of",
+]
+AUDIO_OUTPUT_KEYWORDS = [
+    "generate audio", "create audio", "text to speech", "tts",
+    "synthesize speech", "generate speech", "create a voice", "generate music",
+    "create music", "compose music",
+]
 CODING_KEYWORDS = [
     "write code", "code", "solidity", "script", "function", "program",
     "implement", "debug", "refactor", "api", "python", "javascript",
@@ -165,6 +175,10 @@ class JobRunner:
         output_mods = set(["text"])
         if _matches_any(task, IMAGE_OUTPUT_KEYWORDS):
             output_mods.add("image")
+        if _matches_any(task, VIDEO_OUTPUT_KEYWORDS):
+            output_mods.add("video")
+        if _matches_any(task, AUDIO_OUTPUT_KEYWORDS):
+            output_mods.add("audio")
         if flags.get("output_modality"):
             output_mods.add(flags["output_modality"])
         reqs.output_modalities = sorted(output_mods)
@@ -471,7 +485,13 @@ class JobRunner:
         ranked = self.rank_models(models, reqs)
 
         if not ranked:
-            _log("❌ No models matched requirements", True)
+            out_mods = reqs.output_modalities
+            if any(m in out_mods for m in ["video", "audio"]) and "image" not in out_mods:
+                _log(f"❌ No models on OpenRouter currently support {'/'.join(m for m in out_mods if m != 'text')} output generation.", True)
+                _log("   This is a catalog limitation — video/audio generation isn't available via OpenRouter yet.", True)
+                _log("   Try: Runway, Luma, Sora, or ElevenLabs directly for generative media.", True)
+            else:
+                _log("❌ No models matched your requirements. Try relaxing constraints (budget, modality, context).", True)
             return None
 
         if self.verbose:
