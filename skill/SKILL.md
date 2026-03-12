@@ -1,106 +1,132 @@
-# openrouter-jobrunner Skill
+# OpenRouter Job Runner Skill
 
-## What It Does
+> Give it a job. It finds the best LLM. It runs it.
 
-Automatically selects the best OpenRouter model for any task and runs it. Searches the full 400+ model catalog in real-time — not a curated subset. Picks based on modality fit, budget, capabilities, and context needs.
+## What This Does
 
-## Setup
+Queries the full OpenRouter model catalog (400+ models), analyzes what your task needs (modalities, capabilities, budget), picks the optimal model, and executes it.
 
-1. Copy `jobrunner.py` to `~/.openclaw/skills/openrouter-jobrunner/`
-2. Copy this `SKILL.md` to `~/.openclaw/skills/openrouter-jobrunner/`
-3. Set `OPENROUTER_API_KEY` in your environment
+This is NOT like `openrouter/auto` (which routes across ~6 curated models). This searches the **entire catalog** and filters/ranks based on what the task actually requires.
 
-Or install from the repo:
+## Prerequisites
+
+- `OPENROUTER_API_KEY` environment variable set
+- Python 3.8+ with `requests` installed
+- Script location: `~/.openclaw/skills/openrouter-jobrunner/`
+
+## Usage
+
+### Find the best model (dry run)
 ```bash
-git clone https://github.com/clawdbotatg/clawd-job-runner.git
-cp clawd-job-runner/jobrunner.py ~/.openclaw/skills/openrouter-jobrunner/
-cp clawd-job-runner/skill/SKILL.md ~/.openclaw/skills/openrouter-jobrunner/
+./jobrunner.sh "Write a Solidity smart contract" --dry-run --verbose
 ```
 
-## How To Use (As An Agent)
+### Execute a task
+```bash
+./jobrunner.sh "Write a haiku about Ethereum gas fees"
+```
 
-Import and use the `JobRunner` class:
+### With media inputs
+```bash
+# Image analysis
+./jobrunner.sh "Describe this image" --image https://example.com/photo.jpg
+
+# Video analysis
+./jobrunner.sh "Summarize this video" --video https://example.com/clip.mp4
+
+# Audio transcription
+./jobrunner.sh "Transcribe this" --audio https://example.com/audio.mp3
+
+# File analysis
+./jobrunner.sh "Summarize this PDF" --file report.pdf
+```
+
+### Budget control
+```bash
+# Free models only
+./jobrunner.sh "Quick question" --budget free
+
+# Cheapest option
+./jobrunner.sh "Translate this" --budget cheap
+
+# Best capability
+./jobrunner.sh "Complex analysis" --budget best
+```
+
+### Preference boosts
+```bash
+# Coding-optimized model
+./jobrunner.sh "Write a React component" --prefer coding
+
+# Reasoning-optimized model
+./jobrunner.sh "Prove this theorem" --prefer reasoning
+
+# Speed-optimized model
+./jobrunner.sh "Quick translation" --prefer fast
+```
+
+### Image generation
+```bash
+./jobrunner.sh "Generate pixel art of a lobster" --output-modality image
+```
+
+### JSON output (for piping)
+```bash
+./jobrunner.sh "Explain monads" --json | jq .model
+```
+
+### Force a specific model
+```bash
+./jobrunner.sh "Hello" --model anthropic/claude-sonnet-4
+```
+
+## CLI Flags
+
+| Flag | Effect |
+|---|---|
+| `--budget free\|cheap\|best` | Budget mode |
+| `--prefer coding\|reasoning\|fast` | Preference boost |
+| `--input-modality X` | Force input modality filter |
+| `--output-modality X` | Force output modality filter |
+| `--min-context N` | Minimum context window |
+| `--max-input-cost N` | Max $/M input tokens |
+| `--image URL` | Image URL (repeatable) |
+| `--video URL` | Video URL (repeatable) |
+| `--audio URL` | Audio URL (repeatable) |
+| `--file PATH` | File path or URL (repeatable) |
+| `--dry-run` | Show model, don\'t execute |
+| `--verbose` | Show selection reasoning |
+| `--json` | JSON output |
+| `--system TEXT` | System prompt |
+| `--model ID` | Force specific model |
+
+## Python API
 
 ```python
-import sys
-sys.path.insert(0, os.path.expanduser("~/.openclaw/skills/openrouter-jobrunner"))
 from jobrunner import JobRunner
 
-runner = JobRunner()  # reads OPENROUTER_API_KEY from env
+runner = JobRunner(api_key="sk-or-...", verbose=True)
 
-# Simple text task — auto-selects best model
+# Find best model
+match = runner.find_model("Generate pixel art", output_modality="image")
+print(f"Best model: {match.id}")
+
+# Find and execute
 result = runner.run("Write a haiku about Ethereum gas fees")
 print(result.content)
 print(f"Model: {result.model} | Cost: ${result.cost:.6f}")
-
-# Find model without executing
-model = runner.find_model(
-    task="Generate a pixel art sprite sheet",
-    output_modalities=["image"],
-    max_input_cost=5.0,
-)
-print(f"Would use: {model.id}")
-
-# Image analysis
-result = runner.run(
-    task="Describe what's happening in this image",
-    image_url="https://example.com/photo.jpg",
-    verbose=True,
-)
-
-# Video with reasoning preference
-result = runner.run(
-    task="Analyze this security footage for unusual activity",
-    video_url="https://example.com/clip.mp4",
-    prefer=["reasoning"],
-    verbose=True,
-)
-
-# Cheapest possible
-result = runner.run(
-    task="Translate to French: Hello world",
-    budget="free",
-)
-
-# Coding task, budget capped
-result = runner.run(
-    task="Write a Solidity ERC-20 token with 6 decimals",
-    prefer=["coding"],
-    max_input_cost=1.0,
-)
 ```
 
-## JobResult Fields
+## Output Behavior
 
-| Field | Type | Description |
-|---|---|---|
-| `content` | str | Text output from the model |
-| `model` | str | Actual model ID used |
-| `cost` | float | Estimated cost in USD |
-| `tokens_in` | int | Input tokens used |
-| `tokens_out` | int | Output tokens generated |
-| `image_urls` | list | URLs for image outputs (if any) |
+- **Result content** → stdout (clean for piping)
+- **Verbose/status info** → stderr
+- **JSON mode** → structured output to stdout
 
-## Budget Modes
+## How Model Selection Works
 
-| Mode | Behavior |
-|---|---|
-| `free` | Only free models |
-| `cheap` | Sort by lowest cost first |
-| `best` | Sort by capability (most features, largest context) |
-| `default` | Balanced — moderate cost, solid capability |
-
-## Preference Boosts
-
-| Preference | Effect |
-|---|---|
-| `coding` | Boosts models known for code (Qwen, DeepSeek, etc.) |
-| `reasoning` | Boosts models with reasoning/thinking support |
-| `fast` | Boosts high-throughput models |
-
-## Notes
-
-- API key via `OPENROUTER_API_KEY` env var or `api_key=` param
-- Model catalog is cached per `JobRunner` instance (one fetch per session)
-- Verbose output goes to stderr; result content goes to stdout (clean for piping)
-- Image output models return URLs in `result.image_urls`
+1. **Task Analysis** — detects required modalities from keywords + flags
+2. **Hard Filters** — modality match, context window, cost limits
+3. **Soft Scoring** — preference boosts, provider reputation, capability
+4. **Ranking** — sorted by composite score
+5. **Execution** — top-ranked model runs the task

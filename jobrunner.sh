@@ -1,24 +1,36 @@
 #!/usr/bin/env bash
-# clawd-job-runner entry point
-# Loads .env, then delegates to jobrunner.py
+# clawd-job-runner — Give it a job. It finds the best LLM. It runs it.
+# Bash entry point: loads .env, forwards args to Python.
+
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load .env if present
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
 fi
 
-# Check for python3
+# Check for API key
+if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "Error: OPENROUTER_API_KEY not set." >&2
+    echo "Set it in .env or export it: export OPENROUTER_API_KEY=sk-or-v1-..." >&2
+    exit 1
+fi
+
+# Check Python
 if ! command -v python3 &>/dev/null; then
     echo "Error: python3 not found" >&2
     exit 1
 fi
 
-# Check for requests
-if ! python3 -c "import requests" &>/dev/null; then
-    echo "Installing requests..." >&2
-    pip3 install requests -q
+# Check requests
+if ! python3 -c "import requests" 2>/dev/null; then
+    echo "Error: Python 'requests' package not installed." >&2
+    echo "Install with: pip install requests" >&2
+    exit 1
 fi
 
 exec python3 "$SCRIPT_DIR/jobrunner.py" "$@"

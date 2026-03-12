@@ -2,338 +2,376 @@
 """
 clawd-job-runner — Give it a job. It finds the best LLM. It runs it.
 
-Usage as CLI:
-    python jobrunner.py "Write a bash script that monitors disk usage"
-    python jobrunner.py "Describe this image" --image https://example.com/photo.jpg
-    python jobrunner.py "Summarize this video" --video https://example.com/clip.mp4
-    python jobrunner.py "Translate to French: Hello world" --budget free
-    python jobrunner.py "Write a Solidity ERC-20" --prefer coding --dry-run
-
-Usage as module:
-    from jobrunner import JobRunner
-    runner = JobRunner(api_key="sk-or-...")
-    result = runner.run("Write a haiku about Ethereum gas fees")
-    print(result.content)
+Queries the full OpenRouter model catalog (400+ models), analyzes what your
+task needs, picks the optimal model, and executes it.
 """
 
-import sys
-import os
-import json
 import argparse
-from dataclasses import dataclass, field
-from typing import Optional
-import requests
+import json
+import os
+import re
+import sys
+import base64
+import mimetypes
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Dict, Any, Tuple
 
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' package required. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+__version__ = "1.0.0"
 
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+MODELS_ENDPOINT = f"{OPENROUTER_API_BASE}/models"
+COMPLETIONS_ENDPOINT = f"{OPENROUTER_API_BASE}/chat/completions"
+
+# ─── Keyword heuristics for task analysis ───
+
+IMAGE_INPUT_KEYWORDS = [
+    "this image", "this photo", "this picture", "this screenshot",
+    "the image", "the photo", "the picture", "the screenshot",
+    "attached image", "look at", "what's in this", "describe this",
+    "analyze this image", "ocr", "read the text in",
+]
+VIDEO_INPUT_KEYWORDS = [
+    "this video", "this clip", "the video", "the footage",
+    "watch this", "analyze this video", "summarize this video",
+]
+AUDIO_INPUT_KEYWORDS = [
+    "this audio", "transcribe", "this recording", "this podcast",
+    "listen to", "the audio", "speech to text", "voice memo",
+]
+IMAGE_OUTPUT_KEYWORDS = [
+    "generate image", "create image", "draw", "make an image",
+    "pixel art", "illustration", "generate a picture", "create a photo",
+    "design a logo", "make a poster", "generate art", "create art",
+    "image of", "picture of", "photo of",
+]
+CODING_KEYWORDS = [
+    "write code", "code", "solidity", "script", "function", "program",
+    "implement", "debug", "refactor", "api", "python", "javascript",
+    "typescript", "rust", "golang", "sql", "html", "css", "react",
+    "smart contract", "deploy", "compile", "algorithm", "data structure",
+]
+REASONING_KEYWORDS = [
+    "analyze", "explain", "reason", "think through", "step by step",
+    "why", "compare", "evaluate", "assess", "critique", "proof",
+    "logic", "mathematical", "theorem", "derive", "deduce",
+]
+
+
+@dataclass
+class TaskRequirements:
+    """Detected requirements for a task."""
+    input_modalities: List[str] = field(default_factory=lambda: ["text"])
+    output_modalities: List[str] = field(default_factory=lambda: ["text"])
+    prefer_coding: bool = False
+    prefer_reasoning: bool = False
+    prefer_fast: bool = False
+    min_context: Optional[int] = None
+    max_input_cost: Optional[float] = None
+    budget: Optional[str] = None  # free, cheap, best
+
+
+@dataclass
+class ModelMatch:
+    """A ranked model match."""
+    id: str
+    name: str
+    score: float
+    context_length: int
+    input_modalities: List[str]
+    output_modalities: List[str]
+    prompt_cost: float  # per token (not per million)
+    completion_cost: float
+    max_completion_tokens: Optional[int] = None
+    supported_parameters: List[str] = field(default_factory=list)
+    reason: str = ""
 
 
 @dataclass
 class JobResult:
+    """Result from executing a job."""
     content: str
     model: str
     cost: float
     tokens_in: int
     tokens_out: int
-    reasoning: str = ""
-    image_urls: list = field(default_factory=list)
+    reasoning: Optional[str] = None
+    image_urls: List[str] = field(default_factory=list)
 
 
-@dataclass
-class ModelMatch:
-    id: str
-    name: str
-    score: float
-    input_modalities: list
-    output_modalities: list
-    context_length: int
-    input_cost_per_m: float  # $ per million tokens
-    completion_cost_per_m: float
-    supports_reasoning: bool
-    supports_tools: bool
-    is_free: bool
-    reason: str = ""
+def _log(msg: str, verbose: bool = True):
+    """Print to stderr for verbose output."""
+    if verbose:
+        print(msg, file=sys.stderr)
+
+
+def _matches_any(text: str, keywords: List[str]) -> bool:
+    """Check if text contains any of the keywords (case-insensitive)."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in keywords)
 
 
 class JobRunner:
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY not set. Pass api_key= or set the env var.")
-        self._models_cache = None
+    """Main job runner class — finds the best model and executes tasks."""
 
-    def fetch_models(self) -> list:
-        """Fetch full model catalog from OpenRouter."""
+    def __init__(self, api_key: Optional[str] = None, verbose: bool = False):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self.verbose = verbose
+        self._models_cache: Optional[List[Dict]] = None
+
+    def fetch_models(self) -> List[Dict[str, Any]]:
+        """Fetch the full model catalog from OpenRouter."""
         if self._models_cache is not None:
             return self._models_cache
-        resp = requests.get(f"{OPENROUTER_API_BASE}/models", timeout=15)
-        resp.raise_for_status()
-        self._models_cache = resp.json().get("data", [])
-        return self._models_cache
 
-    def _parse_model(self, m: dict) -> ModelMatch:
-        arch = m.get("architecture", {})
-        pricing = m.get("pricing", {})
-        supported = m.get("supported_parameters", [])
-
-        input_mods = arch.get("input_modalities", ["text"])
-        output_mods = arch.get("output_modalities", ["text"])
-
-        prompt_price = pricing.get("prompt", "0")
-        completion_price = pricing.get("completion", "0")
+        _log("🔍 Fetching OpenRouter model catalog...", self.verbose)
         try:
-            input_cost = float(prompt_price) * 1_000_000
-        except (ValueError, TypeError):
-            input_cost = 0.0
-        try:
-            completion_cost = float(completion_price) * 1_000_000
-        except (ValueError, TypeError):
-            completion_cost = 0.0
+            resp = requests.get(MODELS_ENDPOINT, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            self._models_cache = data.get("data", [])
+            _log(f"📦 Found {len(self._models_cache)} models", self.verbose)
+            return self._models_cache
+        except requests.RequestException as e:
+            _log(f"❌ Failed to fetch models: {e}", True)
+            return []
 
-        is_free = (prompt_price == "0" or input_cost == 0.0)
+    def analyze_task(self, task: str, flags: Optional[Dict[str, Any]] = None) -> TaskRequirements:
+        """Analyze a task string to detect required modalities and capabilities."""
+        flags = flags or {}
+        reqs = TaskRequirements()
 
-        return ModelMatch(
-            id=m.get("id", ""),
-            name=m.get("name", m.get("id", "")),
-            score=0.0,
-            input_modalities=input_mods,
-            output_modalities=output_mods,
-            context_length=m.get("context_length", 0),
-            input_cost_per_m=input_cost,
-            completion_cost_per_m=completion_cost,
-            supports_reasoning="reasoning" in supported or "include_reasoning" in supported,
-            supports_tools="tools" in supported,
-            is_free=is_free,
-        )
-
-    def analyze_task(self, task: str, flags: dict) -> dict:
-        """
-        Heuristic detection of what the task needs.
-        Returns a requirements dict.
-        """
-        task_lower = task.lower()
-
-        # Input modalities needed
-        input_mods = {"text"}
-        if flags.get("image"):
+        # Input modalities
+        input_mods = set(["text"])
+        if flags.get("image") or _matches_any(task, IMAGE_INPUT_KEYWORDS):
             input_mods.add("image")
-        elif any(kw in task_lower for kw in ["this image", "the image", "in this photo", "picture of", "analyze image"]):
-            input_mods.add("image")
-
-        if flags.get("video"):
+        if flags.get("video") or _matches_any(task, VIDEO_INPUT_KEYWORDS):
             input_mods.add("video")
-        elif any(kw in task_lower for kw in ["this video", "the video", "footage", "this clip"]):
-            input_mods.add("video")
-
-        if flags.get("audio"):
+        if flags.get("audio") or _matches_any(task, AUDIO_INPUT_KEYWORDS):
             input_mods.add("audio")
-        elif any(kw in task_lower for kw in ["this audio", "transcribe", "audio file", "this recording"]):
-            input_mods.add("audio")
-
         if flags.get("file"):
             input_mods.add("file")
-        elif any(kw in task_lower for kw in ["this pdf", "this document", "the file", "this spreadsheet"]):
-            input_mods.add("file")
-
-        # Forced modality overrides
+        # Explicit overrides
         if flags.get("input_modality"):
-            for m in flags["input_modality"]:
-                input_mods.add(m)
+            input_mods.add(flags["input_modality"])
+        reqs.input_modalities = sorted(input_mods)
 
-        # Output modalities needed
-        output_mods = {"text"}
-        if flags.get("output_modality"):
-            for m in flags["output_modality"]:
-                output_mods.add(m)
-        elif any(kw in task_lower for kw in ["generate image", "generate an image", "create image", "draw ", "make an image", "pixel art", "generate a picture", "create a picture", "an image of", "a picture of"]):
+        # Output modalities
+        output_mods = set(["text"])
+        if _matches_any(task, IMAGE_OUTPUT_KEYWORDS):
             output_mods.add("image")
+        if flags.get("output_modality"):
+            output_mods.add(flags["output_modality"])
+        reqs.output_modalities = sorted(output_mods)
 
-        # Preference boosts
-        prefer = set()
-        if flags.get("prefer"):
-            prefer.update(flags["prefer"])
-        if any(kw in task_lower for kw in ["write code", "solidity", "function", "bash script", "python script", "implement", "debug", "refactor"]):
-            prefer.add("coding")
-        if any(kw in task_lower for kw in ["analyze", "reason", "explain", "why does", "think through", "step by step"]):
-            prefer.add("reasoning")
+        # Preferences
+        prefer = flags.get("prefer", "")
+        reqs.prefer_coding = prefer == "coding" or _matches_any(task, CODING_KEYWORDS)
+        reqs.prefer_reasoning = prefer == "reasoning" or _matches_any(task, REASONING_KEYWORDS)
+        reqs.prefer_fast = prefer == "fast"
 
-        # Budget
-        budget = flags.get("budget", "default")
+        # Constraints
+        reqs.min_context = flags.get("min_context")
+        reqs.max_input_cost = flags.get("max_input_cost")
+        reqs.budget = flags.get("budget")
 
-        return {
-            "input_modalities": input_mods,
-            "output_modalities": output_mods,
-            "prefer": prefer,
-            "budget": budget,
-            "min_context": flags.get("min_context", 0),
-            "max_input_cost": flags.get("max_input_cost"),
-        }
+        return reqs
 
-    def rank_models(self, models: list, req: dict) -> list[ModelMatch]:
+    def rank_models(self, models: List[Dict], reqs: TaskRequirements) -> List[ModelMatch]:
         """Filter and rank models based on requirements."""
-        parsed = [self._parse_model(m) for m in models]
+        candidates = []
 
-        # Hard filters
-        filtered = []
-        for m in parsed:
-            if not m.id:
-                continue
-            # Modality must match
-            if not req["input_modalities"].issubset(set(m.input_modalities)):
-                continue
-            if not req["output_modalities"].issubset(set(m.output_modalities)):
-                continue
-            # Min context
-            if req.get("min_context") and m.context_length < req["min_context"]:
-                continue
-            # Max input cost
-            if req.get("max_input_cost") is not None and not m.is_free:
-                if m.input_cost_per_m > req["max_input_cost"]:
-                    continue
-            # Free filter
-            if req["budget"] == "free" and not m.is_free:
-                continue
-            filtered.append(m)
+        for m in models:
+            arch = m.get("architecture", {})
+            model_input = arch.get("input_modalities", ["text"])
+            model_output = arch.get("output_modalities", ["text"])
+            pricing = m.get("pricing", {})
+            top = m.get("top_provider", {})
 
-        # Score
-        for m in filtered:
-            score = 0.0
+            # Parse costs (stored as string per-token in API)
+            try:
+                prompt_cost = float(pricing.get("prompt", "0"))
+            except (ValueError, TypeError):
+                prompt_cost = 0.0
+            try:
+                completion_cost = float(pricing.get("completion", "0"))
+            except (ValueError, TypeError):
+                completion_cost = 0.0
 
-            # Preference boosts
-            name_lower = (m.name + " " + m.id).lower()
-            if "coding" in req["prefer"]:
-                if any(kw in name_lower for kw in ["code", "coder", "codex", "qwen", "deepseek", "starcoder", "wizard"]):
-                    score += 10
-            if "reasoning" in req["prefer"]:
-                if m.supports_reasoning:
-                    score += 10
-                if any(kw in name_lower for kw in ["think", "reason", "o1", "o3", "r1", "sonnet", "opus", "gpt-4"]):
-                    score += 5
-            if "fast" in req["prefer"]:
-                # Favor large completion token limits — approximate by context size
-                score += min(m.context_length / 100_000, 10)
+            context_length = m.get("context_length", 0) or 0
+            max_completion = top.get("max_completion_tokens")
 
-            # Context window bonus (log scale)
-            if m.context_length > 0:
-                import math
-                score += math.log10(m.context_length)
+            # ─── Hard filters ───
 
-            # Tool support bonus
-            if m.supports_tools:
-                score += 2
+            # Input modality match: all required input modalities must be supported
+            required_input = set(reqs.input_modalities)
+            if not required_input.issubset(set(model_input)):
+                continue
+
+            # Output modality match
+            required_output = set(reqs.output_modalities)
+            if not required_output.issubset(set(model_output)):
+                continue
+
+            # Min context window
+            if reqs.min_context and context_length < reqs.min_context:
+                continue
+
+            # Max input cost (per million tokens)
+            cost_per_million = prompt_cost * 1_000_000
+            if reqs.max_input_cost is not None and cost_per_million > reqs.max_input_cost:
+                continue
+
+            # Free only
+            if reqs.budget == "free" and prompt_cost > 0:
+                continue
+
+            # Skip openrouter/auto — we ARE the router
+            if m.get("id", "") == "openrouter/auto":
+                continue
+
+            # ─── Scoring ───
+            score = 100.0
+            reasons = []
 
             # Budget-based scoring
-            if req["budget"] == "cheap" or req["budget"] == "free":
+            if reqs.budget == "cheap":
                 # Lower cost = higher score
-                if m.is_free:
+                if cost_per_million > 0:
+                    score -= cost_per_million * 2
+                    reasons.append(f"cost: ${cost_per_million:.2f}/M")
+                else:
                     score += 50
-                elif m.input_cost_per_m > 0:
-                    score += max(0, 20 - m.input_cost_per_m)
-            elif req["budget"] == "best":
-                # Bigger context + more features = better
-                score += min(m.input_cost_per_m, 20)  # More expensive often = better
+                    reasons.append("free model +50")
+            elif reqs.budget == "best":
+                # Larger context + features = higher score
+                score += min(context_length / 10000, 50)
+                reasons.append(f"ctx: {context_length:,}")
+                if max_completion:
+                    score += min(max_completion / 5000, 20)
             else:
-                # Default: balance — moderate cost models preferred
-                if m.is_free:
-                    score += 5
-                elif 0 < m.input_cost_per_m <= 3:
+                # Default: balance quality and cost
+                # Quality signal: higher cost usually = better model, but diminishing returns
+                # We want the sweet spot: capable but not extravagant
+                if cost_per_million >= 1.0:
+                    # Paid models: boost by quality tier
+                    if cost_per_million >= 10.0:
+                        score += 30  # Premium tier (Claude Opus, GPT-4.5, etc.)
+                    elif cost_per_million >= 2.0:
+                        score += 25  # High tier (Sonnet, GPT-4.1, etc.)
+                    elif cost_per_million >= 1.0:
+                        score += 15  # Mid tier
+                    # Within same tier, slightly prefer lower cost (tiebreaker)
+                    score -= min(cost_per_million * 0.1, 3)
+                    # Penalty for very expensive
+                    if cost_per_million > 20.0:
+                        score -= 10
+                elif cost_per_million > 0:
+                    score += 5  # Budget paid
+                else:
+                    score -= 10  # Free models rank lower in default mode
+                # Context bonus (moderate)
+                score += min(context_length / 100000, 10)
+                reasons.append(f"${cost_per_million:.2f}/M")
+
+            # Preference boosts
+            model_id = m.get("id", "").lower()
+            model_name = m.get("name", "").lower()
+            supported_params = m.get("supported_parameters", [])
+
+            if reqs.prefer_coding:
+                coding_models = ["claude", "gpt", "codestral", "deepseek-coder",
+                                 "qwen-coder", "codex", "starcoder", "devstral"]
+                if any(cm in model_id for cm in coding_models):
+                    score += 25
+                    reasons.append("coding boost +25")
+
+            if reqs.prefer_reasoning:
+                if "include_reasoning" in supported_params or "reasoning" in supported_params:
+                    score += 20
+                    reasons.append("reasoning support +20")
+                reasoning_models = ["o1", "o3", "o4", "deepseek-r1", "qwq", "grok"]
+                if any(rm in model_id for rm in reasoning_models):
                     score += 15
-                elif 3 < m.input_cost_per_m <= 10:
-                    score += 8
-                # else expensive, lower score
+                    reasons.append("reasoning model +15")
 
-            m.score = score
+            if reqs.prefer_fast:
+                fast_models = ["flash", "mini", "haiku", "instant", "nano", "lite"]
+                if any(fm in model_id for fm in fast_models):
+                    score += 20
+                    reasons.append("fast model +20")
 
-        filtered.sort(key=lambda m: m.score, reverse=True)
-        return filtered
+            # Penalize deprecated / expiring models
+            if m.get("expiration_date"):
+                score -= 10
+                reasons.append("expiring -10")
 
-    def find_model(
-        self,
-        task: str,
-        input_modalities: Optional[list] = None,
-        output_modalities: Optional[list] = None,
-        max_input_cost: Optional[float] = None,
-        budget: str = "default",
-        prefer: Optional[list] = None,
-        min_context: int = 0,
-        verbose: bool = False,
-    ) -> Optional[ModelMatch]:
-        """Find the best model without executing."""
-        flags = {
-            "budget": budget,
-            "min_context": min_context,
-            "max_input_cost": max_input_cost,
-            "prefer": prefer or [],
-            "input_modality": input_modalities or [],
-            "output_modality": output_modalities or [],
-        }
-        req = self.analyze_task(task, flags)
-        models = self.fetch_models()
-        ranked = self.rank_models(models, req)
+            # Slight boost for well-known providers
+            top_providers = ["anthropic/", "openai/", "google/", "meta-llama/", "x-ai/", "deepseek/"]
+            if any(model_id.startswith(tp) for tp in top_providers):
+                score += 5
+                reasons.append("top provider +5")
 
-        if verbose:
-            print(f"\n🔍 Task analysis:", file=sys.stderr)
-            print(f"   Input modalities: {', '.join(sorted(req['input_modalities']))}", file=sys.stderr)
-            print(f"   Output modalities: {', '.join(sorted(req['output_modalities']))}", file=sys.stderr)
-            if req["prefer"]:
-                print(f"   Preferences: {', '.join(sorted(req['prefer']))}", file=sys.stderr)
-            print(f"   Budget: {req['budget']}", file=sys.stderr)
-            print(f"\n📋 Catalog: {len(models)} models loaded", file=sys.stderr)
-            print(f"   After modality filter: {len(ranked)} models", file=sys.stderr)
+            candidates.append(ModelMatch(
+                id=m["id"],
+                name=m.get("name", m["id"]),
+                score=score,
+                context_length=context_length,
+                input_modalities=model_input,
+                output_modalities=model_output,
+                prompt_cost=prompt_cost,
+                completion_cost=completion_cost,
+                max_completion_tokens=max_completion,
+                supported_parameters=supported_params,
+                reason="; ".join(reasons) if reasons else "baseline",
+            ))
 
-        if not ranked:
-            return None
+        # Sort by score descending
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
 
-        best = ranked[0]
-        runner_up = ranked[1] if len(ranked) > 1 else None
+    def execute(self, task: str, model_id: str, media_urls: Optional[Dict[str, List[str]]] = None,
+                system_prompt: Optional[str] = None) -> JobResult:
+        """Execute a task against a specific model via OpenRouter."""
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY not set")
 
-        if verbose:
-            cost_str = "free" if best.is_free else f"${best.input_cost_per_m:.2f}/M input"
-            print(f"\n🏆 Selected: {best.id}", file=sys.stderr)
-            print(f"   Modalities: {'+'.join(best.input_modalities)}->{'+'.join(best.output_modalities)}", file=sys.stderr)
-            print(f"   Cost: {cost_str} | Context: {best.context_length:,}", file=sys.stderr)
-            if best.supports_reasoning:
-                print(f"   Reasoning: ✓", file=sys.stderr)
-            if runner_up:
-                ru_cost = "free" if runner_up.is_free else f"${runner_up.input_cost_per_m:.2f}/M"
-                print(f"   Runner-up: {runner_up.id} ({ru_cost}, {runner_up.context_length:,} ctx)", file=sys.stderr)
-
-        return best
-
-    def execute(
-        self,
-        task: str,
-        model: ModelMatch,
-        image_url: Optional[str] = None,
-        video_url: Optional[str] = None,
-        audio_url: Optional[str] = None,
-        file_path: Optional[str] = None,
-        verbose: bool = False,
-    ) -> JobResult:
-        """Execute the task with the given model."""
-        if verbose:
-            print(f"\n⚡ Executing with {model.id}...", file=sys.stderr)
+        _log(f"🚀 Executing with {model_id}...", self.verbose)
 
         # Build message content
-        content = []
-
-        # Add media if provided
-        if image_url and "image" in model.input_modalities:
-            content.append({"type": "image_url", "image_url": {"url": image_url}})
-        if video_url and "video" in model.input_modalities:
-            content.append({"type": "video_url", "video_url": {"url": video_url}})
-        if audio_url and "audio" in model.input_modalities:
-            content.append({"type": "audio_url", "audio_url": {"url": audio_url}})
+        content: Any = []
 
         # Add text
         content.append({"type": "text", "text": task})
 
-        # If only text content, simplify to string
-        message_content = content if len(content) > 1 else task
+        # Add media
+        media_urls = media_urls or {}
+        for url in media_urls.get("image", []):
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        for url in media_urls.get("video", []):
+            content.append({"type": "video_url", "video_url": {"url": url}})
+        for url in media_urls.get("audio", []):
+            content.append({"type": "audio_url", "audio_url": {"url": url}})
+        for url in media_urls.get("file", []):
+            content.append({"type": "file_url", "file_url": {"url": url}})
+
+        # If only text, simplify
+        if len(content) == 1 and content[0]["type"] == "text":
+            content = task
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": content})
 
         payload = {
-            "model": model.id,
-            "messages": [{"role": "user", "content": message_content}],
+            "model": model_id,
+            "messages": messages,
         }
 
         headers = {
@@ -343,262 +381,338 @@ class JobRunner:
             "X-Title": "clawd-job-runner",
         }
 
-        resp = requests.post(
-            f"{OPENROUTER_API_BASE}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = requests.post(COMPLETIONS_ENDPOINT, json=payload, headers=headers, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            raise RuntimeError(f"API request failed: {e}")
 
         # Parse response
+        choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        result_content = message.get("content", "")
+        reasoning = message.get("reasoning", None)
+
+        # Handle image output — check for inline images in content
+        image_urls = []
+        if isinstance(result_content, list):
+            # Multi-part response (text + images)
+            text_parts = []
+            for part in result_content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        image_urls.append(part.get("image_url", {}).get("url", ""))
+                else:
+                    text_parts.append(str(part))
+            result_content = "\n".join(text_parts)
+        elif isinstance(result_content, str):
+            # Check for image URLs in text (some models return markdown images)
+            img_pattern = r'!\[.*?\]\((https?://[^\)]+)\)'
+            found = re.findall(img_pattern, result_content)
+            image_urls.extend(found)
+
+        # Token usage
         usage = data.get("usage", {})
         tokens_in = usage.get("prompt_tokens", 0)
         tokens_out = usage.get("completion_tokens", 0)
 
-        # Calculate cost
+        # Cost calculation
         cost = 0.0
-        if not model.is_free:
-            cost = (tokens_in * model.input_cost_per_m / 1_000_000) + \
-                   (tokens_out * model.completion_cost_per_m / 1_000_000)
-
-        # Parse content — handle text and image outputs
-        choices = data.get("choices", [])
-        text_content = ""
-        image_urls = []
-
-        if choices:
-            msg = choices[0].get("message", {})
-            raw_content = msg.get("content", "")
-
-            if isinstance(raw_content, str):
-                text_content = raw_content
-            elif isinstance(raw_content, list):
-                for part in raw_content:
-                    if part.get("type") == "text":
-                        text_content += part.get("text", "")
-                    elif part.get("type") == "image_url":
-                        image_urls.append(part.get("image_url", {}).get("url", ""))
+        if "total_cost" in usage:
+            cost = float(usage["total_cost"])
+        else:
+            # Estimate from token counts
+            models = self.fetch_models()
+            for m in models:
+                if m["id"] == model_id:
+                    pricing = m.get("pricing", {})
+                    pc = float(pricing.get("prompt", "0"))
+                    cc = float(pricing.get("completion", "0"))
+                    cost = (tokens_in * pc) + (tokens_out * cc)
+                    break
 
         return JobResult(
-            content=text_content,
-            model=data.get("model", model.id),
+            content=result_content,
+            model=model_id,
             cost=cost,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            reasoning=reasoning,
             image_urls=image_urls,
         )
 
-    def run(
-        self,
-        task: str,
-        input_modalities: Optional[list] = None,
-        output_modalities: Optional[list] = None,
-        max_input_cost: Optional[float] = None,
-        budget: str = "default",
-        prefer: Optional[list] = None,
-        min_context: int = 0,
-        image_url: Optional[str] = None,
-        video_url: Optional[str] = None,
-        audio_url: Optional[str] = None,
-        file_path: Optional[str] = None,
-        verbose: bool = False,
-    ) -> JobResult:
+    def find_model(self, task: str, **kwargs) -> Optional[ModelMatch]:
+        """Find the best model for a task without executing it."""
+        flags = {}
+        for key in ["image", "video", "audio", "file", "input_modality",
+                     "output_modality", "prefer", "min_context", "max_input_cost", "budget"]:
+            if key in kwargs:
+                flags[key] = kwargs[key]
+
+        reqs = self.analyze_task(task, flags)
+
+        if self.verbose:
+            _log(f"\n📋 Task Analysis:", True)
+            _log(f"   Input:  {', '.join(reqs.input_modalities)}", True)
+            _log(f"   Output: {', '.join(reqs.output_modalities)}", True)
+            if reqs.prefer_coding:
+                _log(f"   🔧 Coding preference detected", True)
+            if reqs.prefer_reasoning:
+                _log(f"   🧠 Reasoning preference detected", True)
+            if reqs.prefer_fast:
+                _log(f"   ⚡ Speed preference detected", True)
+            if reqs.budget:
+                _log(f"   💰 Budget: {reqs.budget}", True)
+            if reqs.min_context:
+                _log(f"   📏 Min context: {reqs.min_context:,}", True)
+            if reqs.max_input_cost is not None:
+                _log(f"   💲 Max input cost: ${reqs.max_input_cost}/M", True)
+
+        models = self.fetch_models()
+        ranked = self.rank_models(models, reqs)
+
+        if not ranked:
+            _log("❌ No models matched requirements", True)
+            return None
+
+        if self.verbose:
+            _log(f"\n🏆 Top 5 matches:", True)
+            for i, m in enumerate(ranked[:5]):
+                cost_m = m.prompt_cost * 1_000_000
+                marker = "👉" if i == 0 else "  "
+                _log(f"   {marker} {i+1}. {m.name}", True)
+                _log(f"        {m.id} | ctx: {m.context_length:,} | ${cost_m:.2f}/M", True)
+                _log(f"        Score: {m.score:.1f} ({m.reason})", True)
+
+        winner = ranked[0]
+        _log(f"\n✅ Selected: {winner.name} ({winner.id})", self.verbose)
+        return winner
+
+    def run(self, task: str, media_urls: Optional[Dict[str, List[str]]] = None,
+            system_prompt: Optional[str] = None, **kwargs) -> JobResult:
         """Find the best model and execute the task."""
-        model = self.find_model(
-            task=task,
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            max_input_cost=max_input_cost,
-            budget=budget,
-            prefer=prefer,
-            min_context=min_context,
-            verbose=verbose,
-        )
-        if not model:
-            raise RuntimeError("No suitable model found for this task with the given constraints.")
+        match = self.find_model(task, **kwargs)
+        if not match:
+            raise RuntimeError("No suitable model found for this task")
 
-        return self.execute(
-            task=task,
-            model=model,
-            image_url=image_url,
-            video_url=video_url,
-            audio_url=audio_url,
-            file_path=file_path,
-            verbose=verbose,
-        )
+        return self.execute(task, match.id, media_urls=media_urls, system_prompt=system_prompt)
 
 
-def main():
+# ─── CLI ───
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="clawd-job-runner: Give it a job. It finds the best LLM. It runs it.",
+        prog="jobrunner",
+        description="🦞 clawd-job-runner — Give it a job. It finds the best LLM. It runs it.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s "Write a bash script that monitors disk usage"
-  %(prog)s "Describe what's in this image" --image https://example.com/photo.jpg
-  %(prog)s "Summarize this video" --video https://example.com/clip.mp4
-  %(prog)s "Translate to French: Hello world" --budget free
-  %(prog)s "Write a Solidity ERC-20" --prefer coding --budget cheap
-  %(prog)s "Analyze this codebase" --prefer reasoning --min-context 100000
-  %(prog)s "Explain quantum computing" --dry-run --verbose
-        """,
+  %(prog)s "Write a haiku about Ethereum gas fees"
+  %(prog)s "Describe this image" --image https://example.com/photo.jpg
+  %(prog)s "Generate pixel art of a lobster" --output-modality image
+  %(prog)s "Write a Solidity contract" --prefer coding --budget cheap
+  %(prog)s "Analyze this codebase" --min-context 200000 --prefer reasoning
+  %(prog)s "Transcribe this" --audio https://example.com/audio.mp3
+  %(prog)s "What's in this video?" --video https://example.com/clip.mp4
+  %(prog)s "Summarize this PDF" --file report.pdf
+  %(prog)s "Quick translation" --prefer fast --dry-run
+  %(prog)s "Complex math proof" --prefer reasoning --budget best --json
+        """
     )
 
-    parser.add_argument("task", help="The task to run")
+    parser.add_argument("task", nargs="?", help="Task description (or pipe via stdin)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
-    # Media inputs
-    parser.add_argument("--image", metavar="URL", help="Image URL to pass to the model")
-    parser.add_argument("--video", metavar="URL", help="Video URL to pass to the model")
-    parser.add_argument("--audio", metavar="URL", help="Audio URL to pass to the model")
-    parser.add_argument("--file", metavar="PATH", help="File path to pass to the model")
-
-    # Budget
-    parser.add_argument(
-        "--budget",
-        choices=["free", "cheap", "best", "default"],
-        default="default",
-        help="Budget mode: free (only free), cheap (lowest cost), best (most capable), default (balanced)",
-    )
-
-    # Preferences
-    parser.add_argument(
-        "--prefer",
-        action="append",
-        choices=["coding", "reasoning", "fast"],
-        metavar="PREF",
-        help="Boost certain model types (coding, reasoning, fast). Can repeat.",
-    )
+    # Budget & preferences
+    parser.add_argument("--budget", choices=["free", "cheap", "best"],
+                        help="Budget mode: free (free models only), cheap (lowest cost), best (max capability)")
+    parser.add_argument("--prefer", choices=["coding", "reasoning", "fast"],
+                        help="Preference boost for model selection")
 
     # Modality overrides
-    parser.add_argument(
-        "--input-modality",
-        action="append",
-        metavar="MOD",
-        help="Force input modality filter (text/image/video/audio/file). Can repeat.",
-    )
-    parser.add_argument(
-        "--output-modality",
-        action="append",
-        metavar="MOD",
-        help="Force output modality (text/image/audio). Can repeat.",
-    )
+    parser.add_argument("--input-modality", dest="input_modality",
+                        choices=["text", "image", "video", "audio", "file"],
+                        help="Force input modality filter")
+    parser.add_argument("--output-modality", dest="output_modality",
+                        choices=["text", "image", "audio"],
+                        help="Force output modality filter")
 
-    # Context / cost
-    parser.add_argument("--min-context", type=int, default=0, metavar="N", help="Minimum context window size")
-    parser.add_argument("--max-input-cost", type=float, metavar="N", help="Max $/M input tokens (e.g. 1.0)")
+    # Constraints
+    parser.add_argument("--min-context", dest="min_context", type=int,
+                        help="Minimum context window size")
+    parser.add_argument("--max-input-cost", dest="max_input_cost", type=float,
+                        help="Maximum input cost in $/million tokens")
+
+    # Media inputs
+    parser.add_argument("--image", action="append", default=[],
+                        help="Image URL to include (can repeat)")
+    parser.add_argument("--video", action="append", default=[],
+                        help="Video URL to include (can repeat)")
+    parser.add_argument("--audio", action="append", default=[],
+                        help="Audio URL to include (can repeat)")
+    parser.add_argument("--file", action="append", default=[], dest="files",
+                        help="File path or URL to include (can repeat)")
 
     # Output modes
-    parser.add_argument("--dry-run", action="store_true", help="Show selected model but don't execute")
-    parser.add_argument("--verbose", action="store_true", help="Show full model selection reasoning")
-    parser.add_argument("--json", action="store_true", dest="json_output", help="Output result as JSON")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="Show selected model without executing")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show model selection reasoning on stderr")
+    parser.add_argument("--json", action="store_true", dest="json_output",
+                        help="Output result as JSON")
 
-    # API key
-    parser.add_argument("--api-key", metavar="KEY", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
+    # Advanced
+    parser.add_argument("--system", type=str, default=None,
+                        help="System prompt to prepend")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Force a specific model (skip selection)")
 
+    return parser
+
+
+def _file_to_data_url(path: str) -> str:
+    """Convert a local file path to a data URL."""
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        mime = "application/octet-stream"
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{data}"
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    # Resolve API key
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        print("Error: OPENROUTER_API_KEY not set. Use --api-key or set the env var.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        runner = JobRunner(api_key=api_key)
-
-        flags = {
-            "budget": args.budget,
-            "prefer": args.prefer or [],
-            "min_context": args.min_context,
-            "max_input_cost": args.max_input_cost,
-            "input_modality": args.input_modality or [],
-            "output_modality": args.output_modality or [],
-            "image": args.image,
-            "video": args.video,
-            "audio": args.audio,
-            "file": args.file,
-        }
-
-        # Find model
-        model = runner.find_model(
-            task=args.task,
-            input_modalities=args.input_modality,
-            output_modalities=args.output_modality,
-            max_input_cost=args.max_input_cost,
-            budget=args.budget,
-            prefer=args.prefer,
-            min_context=args.min_context,
-            verbose=args.verbose or args.dry_run,
-        )
-
-        if not model:
-            print("❌ No suitable model found for this task with the given constraints.", file=sys.stderr)
+    # Get task from args or stdin
+    task = args.task
+    if not task:
+        if not sys.stdin.isatty():
+            task = sys.stdin.read().strip()
+        else:
+            parser.print_help(sys.stderr)
             sys.exit(1)
 
-        if args.dry_run:
-            if args.json_output:
-                result = {
-                    "dry_run": True,
-                    "model": model.id,
-                    "name": model.name,
-                    "input_modalities": model.input_modalities,
-                    "output_modalities": model.output_modalities,
-                    "context_length": model.context_length,
-                    "input_cost_per_m": model.input_cost_per_m,
-                    "is_free": model.is_free,
-                    "supports_reasoning": model.supports_reasoning,
-                }
-                print(json.dumps(result, indent=2))
+    if not task:
+        print("Error: No task provided", file=sys.stderr)
+        sys.exit(1)
+
+    # Build flags
+    flags = {}
+    if args.image:
+        flags["image"] = True
+    if args.video:
+        flags["video"] = True
+    if args.audio:
+        flags["audio"] = True
+    if args.files:
+        flags["file"] = True
+    if args.input_modality:
+        flags["input_modality"] = args.input_modality
+    if args.output_modality:
+        flags["output_modality"] = args.output_modality
+    if args.prefer:
+        flags["prefer"] = args.prefer
+    if args.min_context:
+        flags["min_context"] = args.min_context
+    if args.max_input_cost is not None:
+        flags["max_input_cost"] = args.max_input_cost
+    if args.budget:
+        flags["budget"] = args.budget
+
+    # Build media URLs
+    media_urls: Dict[str, List[str]] = {}
+    if args.image:
+        media_urls["image"] = args.image
+    if args.video:
+        media_urls["video"] = args.video
+    if args.audio:
+        media_urls["audio"] = args.audio
+    if args.files:
+        file_urls = []
+        for f in args.files:
+            if f.startswith("http://") or f.startswith("https://") or f.startswith("data:"):
+                file_urls.append(f)
+            elif os.path.exists(f):
+                file_urls.append(_file_to_data_url(f))
             else:
-                cost_str = "free" if model.is_free else f"${model.input_cost_per_m:.2f}/M input"
-                print(f"\n🏆 Would use: {model.id}")
-                print(f"   Name: {model.name}")
-                print(f"   Cost: {cost_str} | Context: {model.context_length:,}")
-                print(f"   Modalities: {'+'.join(model.input_modalities)} → {'+'.join(model.output_modalities)}")
+                print(f"Warning: File not found: {f}", file=sys.stderr)
+                file_urls.append(f)
+        media_urls["file"] = file_urls
+
+    runner = JobRunner(verbose=args.verbose or args.dry_run)
+
+    try:
+        if args.model:
+            # Forced model — skip selection
+            if args.dry_run:
+                _log(f"✅ Using forced model: {args.model}", True)
+                if args.json_output:
+                    print(json.dumps({"model": args.model, "dry_run": True}, indent=2))
+                sys.exit(0)
+            result = runner.execute(task, args.model, media_urls=media_urls,
+                                    system_prompt=args.system)
+        elif args.dry_run:
+            match = runner.find_model(task, **flags)
+            if not match:
+                sys.exit(1)
+            if args.json_output:
+                print(json.dumps({
+                    "model": match.id,
+                    "name": match.name,
+                    "score": match.score,
+                    "context_length": match.context_length,
+                    "input_modalities": match.input_modalities,
+                    "output_modalities": match.output_modalities,
+                    "prompt_cost_per_million": match.prompt_cost * 1_000_000,
+                    "completion_cost_per_million": match.completion_cost * 1_000_000,
+                    "reason": match.reason,
+                    "dry_run": True,
+                }, indent=2))
+            else:
+                cost_m = match.prompt_cost * 1_000_000
+                print(f"{match.id}")
+                _log(f"\n📊 {match.name}", True)
+                _log(f"   Context: {match.context_length:,} tokens", True)
+                _log(f"   Cost: ${cost_m:.2f}/M input tokens", True)
+                _log(f"   In:  {', '.join(match.input_modalities)}", True)
+                _log(f"   Out: {', '.join(match.output_modalities)}", True)
             sys.exit(0)
+        else:
+            result = runner.run(task, media_urls=media_urls,
+                                system_prompt=args.system, **flags)
 
-        # Execute
-        result = runner.execute(
-            task=args.task,
-            model=model,
-            image_url=args.image,
-            video_url=args.video,
-            audio_url=args.audio,
-            file_path=args.file,
-            verbose=args.verbose,
-        )
-
+        # Output result
         if args.json_output:
             output = {
                 "content": result.content,
-                "image_urls": result.image_urls,
                 "model": result.model,
                 "cost": result.cost,
                 "tokens_in": result.tokens_in,
                 "tokens_out": result.tokens_out,
             }
+            if result.reasoning:
+                output["reasoning"] = result.reasoning
+            if result.image_urls:
+                output["image_urls"] = result.image_urls
             print(json.dumps(output, indent=2))
         else:
-            # Print result to stdout (clean for piping)
-            if result.content:
-                print(result.content)
-            for url in result.image_urls:
-                print(f"🖼️  Image: {url}")
-
+            # Clean output to stdout
+            print(result.content)
+            if result.image_urls:
+                for url in result.image_urls:
+                    print(f"\n🖼️  {url}")
             # Metadata to stderr
-            cost_str = f"${result.cost:.6f}" if result.cost > 0 else "free"
-            print(f"\n💰 Cost: {cost_str} | Tokens: {result.tokens_in:,} in / {result.tokens_out:,} out | Model: {result.model}", file=sys.stderr)
+            _log(f"\n📊 Model: {result.model}", True)
+            _log(f"   Tokens: {result.tokens_in:,} in / {result.tokens_out:,} out", True)
+            if result.cost > 0:
+                _log(f"   Cost: ${result.cost:.6f}", True)
 
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 

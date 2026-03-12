@@ -1,217 +1,257 @@
-# 🧠 clawd-job-runner
+# 🦞 clawd-job-runner
 
 > Give it a job. It finds the best LLM. It runs it.
 
-A single-file CLI tool that takes any task — generate an image, analyze a video, write code, summarize a PDF — queries the full OpenRouter model catalog in real-time, picks the optimal model based on what the task actually needs, and executes it. One command, zero model selection.
+A CLI tool that queries the **full OpenRouter model catalog** (400+ models), analyzes what your task needs, picks the optimal model, and executes it.
 
-There are 400+ models on OpenRouter. You shouldn't have to know which one accepts video, which one is cheapest for code, or which one can do tool calling. Describe what you want done, and the jobrunner figures out the rest.
+This is NOT like `openrouter/auto` (which routes across ~6 curated models). This searches the **entire catalog** and filters/ranks based on what the task actually requires — modalities, capabilities, budget, and preferences.
 
-**This is different from OpenRouter's built-in `openrouter/auto`** — that routes across ~6 curated models. The jobrunner searches the entire catalog and picks based on:
-
-- **Required modalities** (text, image, video, audio, file input → text, image, audio output)
-- **Budget** (set a max $/million tokens, or let it optimize)
-- **Capabilities** (tool calling, structured output, reasoning)
-- **Context window** (need 100K+? 1M? filtered automatically)
-- **Speed vs quality** (prefer free models? cheapest? biggest context?)
-
-## Install
+## Quick Start
 
 ```bash
+# Clone
 git clone https://github.com/clawdbotatg/clawd-job-runner.git
 cd clawd-job-runner
+
+# Install dependency
 pip install requests
-export OPENROUTER_API_KEY="sk-or-..."
-```
 
-Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+# Set your API key
+cp .env.example .env
+# Edit .env with your OpenRouter API key
 
-Or create a `.env` file:
-```
-OPENROUTER_API_KEY=sk-or-v1-...
-```
-
-## Usage
-
-```bash
-# Text task — finds best text model
-./jobrunner.sh "Write a bash script that monitors disk usage and sends alerts"
-
-# Image analysis — finds a vision model
-./jobrunner.sh "Describe what's in this image" --image https://example.com/photo.jpg
-
-# Video analysis — finds a video-capable model
-./jobrunner.sh "Summarize this video" --video https://example.com/clip.mp4
-
-# Code generation — prefers coding models
-./jobrunner.sh "Write a Solidity ERC-20 token with 6 decimals" --prefer coding
-
-# Cheapest possible — free models first
-./jobrunner.sh "Translate this to French: Hello world" --budget free
-
-# Force a specific modality filter
-./jobrunner.sh "Transcribe this audio" --input-modality audio
-
-# Max budget: $1/M input tokens
-./jobrunner.sh "Analyze this codebase for security issues" --max-input-cost 1.0
-
-# See what model it would pick without running
-./jobrunner.sh "Explain quantum computing" --dry-run
-
-# Full verbose output
-./jobrunner.sh "Analyze this security footage" --video ./footage.mp4 --prefer reasoning --verbose
+# Run it
+./jobrunner.sh "Write a haiku about Ethereum gas fees"
 ```
 
 ## How It Works
 
 ```
-┌─────────────────┐
-│   Your Task     │  "Analyze this video for safety violations"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Task Analyzer  │  Detects: needs video input, text output
-│                 │  Infers: reasoning helpful, long output
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Model Catalog  │  GET /api/v1/models → 400+ models
-│  (live query)   │  Filter: input_modalities includes "video"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│     Ranker      │  Score by: modality fit → pricing → context
-│                 │  Apply budget/preference constraints
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│    Execute      │  POST /api/v1/chat/completions
-│                 │  model: "google/gemini-3.1-flash-image-preview"
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│     Result      │  Output + metadata:
-│                 │  "Used google/gemini-3.1-flash-lite-preview"
-│                 │  "Cost: $0.0003 | Tokens: 847"
-└─────────────────┘
+Your Task
+   │
+   ▼
+Task Analyzer        ─ detect required modalities, infer capabilities
+   │
+   ▼
+Model Catalog        ─ GET /api/v1/models → live 400+ model list
+   │
+   ▼
+Ranker               ─ filter by modality → apply budget/prefs → rank
+   │
+   ▼
+Execute              ─ POST /api/v1/chat/completions with chosen model
+   │
+   ▼
+Result               ─ output + metadata (model, cost, tokens)
 ```
 
-## Flags
+## Examples
+
+### Basic usage
+```bash
+$ ./jobrunner.sh "Write a haiku about Ethereum gas fees"
+Gas prices spike high
+Validators feast on fees
+My wallet weeps dry
+```
+
+### See model selection reasoning
+```bash
+$ ./jobrunner.sh "Write a Solidity smart contract for an ERC-721" --prefer coding --verbose
+
+📋 Task Analysis:
+   Input:  text
+   Output: text
+   🔧 Coding preference detected
+
+🔍 Fetching OpenRouter model catalog...
+📦 Found 344 models
+
+🏆 Top 5 matches:
+   👉 1. Anthropic: Claude Opus 4
+        anthropic/claude-opus-4 | ctx: 200,000 | $15.00/M
+        Score: 137.0 (coding boost +25; top provider +5)
+     2. Anthropic: Claude Sonnet 4
+        anthropic/claude-sonnet-4 | ctx: 200,000 | $3.00/M
+        Score: 133.5 (coding boost +25; top provider +5)
+   ...
+
+✅ Selected: Anthropic: Claude Opus 4 (anthropic/claude-opus-4)
+🚀 Executing with anthropic/claude-opus-4...
+```
+
+### Image analysis
+```bash
+$ ./jobrunner.sh "What's in this image?" --image https://example.com/photo.jpg --verbose
+
+📋 Task Analysis:
+   Input:  image, text
+   Output: text
+```
+
+### Image generation
+```bash
+$ ./jobrunner.sh "Generate pixel art of a crab" --output-modality image
+```
+
+### Video analysis
+```bash
+$ ./jobrunner.sh "Summarize this video" --video https://example.com/clip.mp4
+```
+
+### Audio transcription
+```bash
+$ ./jobrunner.sh "Transcribe this recording" --audio https://example.com/audio.mp3
+```
+
+### Budget control
+```bash
+# Free models only
+$ ./jobrunner.sh "Quick question" --budget free
+
+# Cheapest option
+$ ./jobrunner.sh "Translate this paragraph" --budget cheap
+
+# Best capability (largest context, most features)
+$ ./jobrunner.sh "Analyze this entire codebase" --budget best --min-context 200000
+```
+
+### Dry run — see what model would be picked
+```bash
+$ ./jobrunner.sh "Complex math proof" --prefer reasoning --budget best --dry-run
+x-ai/grok-4.20-multi-agent-beta
+
+📊 xAI: Grok 4.20 Multi-Agent Beta
+   Context: 2,000,000 tokens
+   Cost: $2.00/M input tokens
+   In:  text, image
+   Out: text
+```
+
+### JSON output (for piping)
+```bash
+$ ./jobrunner.sh "Explain monads" --json | jq .model
+"anthropic/claude-sonnet-4"
+```
+
+### Force a specific model
+```bash
+$ ./jobrunner.sh "Hello" --model anthropic/claude-sonnet-4
+```
+
+### Pipe from stdin
+```bash
+$ echo "Explain this error" | ./jobrunner.sh
+```
+
+### Local file analysis
+```bash
+$ ./jobrunner.sh "Summarize this document" --file report.pdf
+```
+
+## CLI Flags
 
 | Flag | Effect |
 |---|---|
-| `--budget free` | Only free models (pricing = "0") |
-| `--budget cheap` | Sort by lowest cost first |
-| `--budget best` | Sort by capability (largest context, most features) |
-| `--prefer coding` | Boost models with "code" in name/description |
-| `--prefer reasoning` | Boost models that support reasoning parameter |
-| `--prefer fast` | Boost models with high max_completion_tokens |
-| `--input-modality X` | Filter to models accepting X (text/image/video/audio/file) |
-| `--output-modality X` | Filter to models outputting X (text/image/audio) |
-| `--min-context N` | Minimum context window (e.g., 100000) |
-| `--max-input-cost N` | Max $/M input tokens (e.g., 1.0) |
-| `--image URL` | Pass image URL to model |
-| `--video URL` | Pass video URL to model |
-| `--audio URL` | Pass audio URL to model |
-| `--file PATH` | Pass file path to model |
-| `--dry-run` | Show selected model + reasoning, don't execute |
-| `--verbose` | Show full model selection reasoning |
+| `--budget free\|cheap\|best` | Budget mode for model selection |
+| `--prefer coding\|reasoning\|fast` | Preference boost |
+| `--input-modality X` | Force input modality filter (text/image/video/audio/file) |
+| `--output-modality X` | Force output modality filter (text/image/audio) |
+| `--min-context N` | Minimum context window size |
+| `--max-input-cost N` | Maximum input cost in $/million tokens |
+| `--image URL` | Image URL to include (repeatable) |
+| `--video URL` | Video URL to include (repeatable) |
+| `--audio URL` | Audio URL to include (repeatable) |
+| `--file PATH` | File path or URL to include (repeatable) |
+| `--dry-run` | Show selected model, don't execute |
+| `--verbose, -v` | Show full model selection reasoning (stderr) |
 | `--json` | Output result as JSON |
-
-## Example Output
-
-```bash
-$ ./jobrunner.sh "Analyze this security footage for unusual activity" \
-    --video ./footage.mp4 --prefer reasoning --verbose
-
-🔍 Task analysis:
-   Input modalities: text, video
-   Output modalities: text
-   Preferences: reasoning
-   Budget: default
-
-📋 Catalog: 344 models loaded
-   After modality filter: 28 models
-
-🏆 Selected: google/gemini-3.1-flash-image-preview
-   Modalities: image+text+video → text
-   Cost: $0.50/M input | Context: 1,000,000
-   Reasoning: ✓
-   Runner-up: openrouter/healer-alpha (free, 128,000 ctx)
-
-⚡ Executing with google/gemini-3.1-flash-image-preview...
-
-[... analysis output ...]
-
-💰 Cost: $0.000847 | Tokens: 2,391 in / 1,203 out | Model: google/gemini-3.1-flash-image-preview
-```
-
-## Files
-
-| File | What it does |
-|---|---|
-| `jobrunner.sh` | Entry point — loads .env, calls python |
-| `jobrunner.py` | Core logic — model discovery, ranking, execution |
-| `requirements.txt` | Just `requests` (stdlib otherwise) |
-| `skill/SKILL.md` | OpenClaw skill wrapper |
+| `--system TEXT` | System prompt to prepend |
+| `--model ID` | Force a specific model (skip selection) |
 
 ## Python API
 
 ```python
 from jobrunner import JobRunner
 
-runner = JobRunner(api_key="sk-or-...")
+runner = JobRunner(api_key="sk-or-...", verbose=True)
 
 # Find best model without executing
 match = runner.find_model(
     task="Generate a pixel art sprite sheet",
-    output_modalities=["image"],
-    max_input_cost=5.0,  # $/M tokens
+    output_modality="image",
+    max_input_cost=5.0,
 )
-print(f"Would use: {match.id} at ${match.input_cost_per_m:.2f}/M")
+print(f"Best: {match.id} (score: {match.score})")
 
 # Find and execute
 result = runner.run("Write a haiku about Ethereum gas fees")
 print(result.content)
 print(f"Model: {result.model} | Cost: ${result.cost:.6f}")
 
-# Image analysis
+# With media
 result = runner.run(
     "Describe this image",
-    image_url="https://example.com/photo.jpg",
-    verbose=True,
+    media_urls={"image": ["https://example.com/photo.jpg"]},
+    image=True,
 )
 
-# Budget-constrained coding task
-result = runner.run(
-    "Write a FastAPI server with JWT auth",
-    prefer=["coding"],
-    budget="cheap",
-)
+# Budget mode
+result = runner.run("Quick task", budget="free")
 ```
 
-## OpenClaw Skill
+## Model Selection Algorithm
 
-Drop `skill/SKILL.md` + `jobrunner.py` into `~/.openclaw/skills/openrouter-jobrunner/` and any agent can use it:
+1. **Task Analysis** — keyword/heuristic detection on the task string + flags
+2. **Hard Filters:**
+   - Input modality match (all required modalities must be supported)
+   - Output modality match
+   - Minimum context window
+   - Maximum input cost
+   - Free-only filter
+3. **Soft Scoring:**
+   - Budget mode adjustments (cheap → lower cost wins, best → bigger context wins)
+   - Preference boosts (coding/reasoning/fast → relevant model families get +25)
+   - Provider reputation (+5 for top providers)
+   - Expiration penalty (-10 for expiring models)
+4. **Ranking** — sorted by composite score, best first
 
+## Output Behavior
+
+- **Result content** → `stdout` (clean for piping)
+- **Verbose/status info** → `stderr`
+- **JSON mode** → structured output to `stdout`
+
+This means you can pipe results cleanly:
+```bash
+./jobrunner.sh "Write a Python script" > output.py
+./jobrunner.sh "Explain X" --json | jq .cost
 ```
-"Use the openrouter-jobrunner skill to find the best model for analyzing this video and run it"
+
+## Requirements
+
+- Python 3.8+
+- `requests` package
+- OpenRouter API key ([get one here](https://openrouter.ai/keys))
+
+## Install
+
+```bash
+git clone https://github.com/clawdbotatg/clawd-job-runner.git
+cd clawd-job-runner
+pip install -r requirements.txt
+cp .env.example .env
+# Add your OPENROUTER_API_KEY to .env
 ```
 
-## Features
+### As an OpenClaw Skill
 
-- **Full catalog** — searches all 400+ OpenRouter models, not a curated subset
-- **Modality-aware** — actually checks if the model can handle your input type
-- **Live pricing** — always uses current pricing from the API
-- **Transparent** — tells you exactly which model it picked and why
-- **Budget control** — from free to frontier, you set the ceiling
-- **Zero config** — one API key, one command, done
-- **Pipeable** — result to stdout, metadata to stderr
+```bash
+mkdir -p ~/.openclaw/skills/openrouter-jobrunner
+cp jobrunner.py skill/SKILL.md ~/.openclaw/skills/openrouter-jobrunner/
+cp jobrunner.sh ~/.openclaw/skills/openrouter-jobrunner/
+```
 
 ## License
 
-MIT — do whatever you want with it.
+MIT — see [LICENSE](LICENSE)
