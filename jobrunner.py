@@ -13,6 +13,7 @@ import re
 import sys
 import base64
 import mimetypes
+import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -22,7 +23,7 @@ except ImportError:
     print("Error: 'requests' package required. Install with: pip install requests", file=sys.stderr)
     sys.exit(1)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
 MODELS_ENDPOINT = f"{OPENROUTER_API_BASE}/models"
@@ -71,6 +72,17 @@ REASONING_KEYWORDS = [
     "why", "compare", "evaluate", "assess", "critique", "proof",
     "logic", "mathematical", "theorem", "derive", "deduce",
 ]
+
+# ─── AI Intent Detection (Stage 1) ───
+
+AI_DETECT_MODEL = "google/gemini-3.1-flash-lite-preview"
+AI_DETECT_PROMPT = """You classify tasks for LLM routing. Given a task, return JSON only:
+{"input_modalities":["text"],"output_modalities":["text"],"prefer":[],"budget_hint":"default","reasoning":"why"}
+Valid input_modalities: text, image, video, audio, file
+Valid output_modalities: text, image, video, audio
+Valid prefer: coding, reasoning, fast (can be empty list)
+Valid budget_hint: cheap, free, best, default
+Task: """
 
 
 @dataclass
@@ -151,9 +163,8 @@ class JobRunner:
             _log(f"❌ Failed to fetch models: {e}", True)
             return []
 
-    def analyze_task(self, task: str, flags: Optional[Dict[str, Any]] = None) -> TaskRequirements:
-        """Analyze a task string to detect required modalities and capabilities."""
-        flags = flags or {}
+    def _keyword_analyze(self, task: str, flags: Dict[str, Any]) -> TaskRequirements:
+        """Keyword-based task analysis (fallback when AI detection is skipped or fails)."""
         reqs = TaskRequirements()
 
         # Input modalities
@@ -166,7 +177,6 @@ class JobRunner:
             input_mods.add("audio")
         if flags.get("file"):
             input_mods.add("file")
-        # Explicit overrides
         if flags.get("input_modality"):
             input_mods.add(flags["input_modality"])
         reqs.input_modalities = sorted(input_mods)
@@ -193,6 +203,125 @@ class JobRunner:
         reqs.min_context = flags.get("min_context")
         reqs.max_input_cost = flags.get("max_input_cost")
         reqs.budget = flags.get("budget")
+
+        return reqs
+
+    def _ai_analyze(self, task: str) -> Optional[Dict[str, Any]]:
+        """Stage 1: Use a cheap/fast model to detect task intent. Returns parsed JSON or None on failure."""
+        if not self.api_key:
+            return None
+
+        prompt = AI_DETECT_PROMPT + task
+        payload = {
+            "model": AI_DETECT_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 150,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/clawdbotatg/clawd-job-runner",
+            "X-Title": "clawd-job-runner",
+        }
+
+        try:
+            t0 = time.time()
+            resp = requests.post(COMPLETIONS_ENDPOINT, json=payload, headers=headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            elapsed = time.time() - t0
+
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            result = json.loads(content)
+
+            # Validate required fields
+            valid_input = {"text", "image", "video", "audio", "file"}
+            valid_output = {"text", "image", "video", "audio"}
+            valid_prefer = {"coding", "reasoning", "fast"}
+            valid_budget = {"cheap", "free", "best", "default"}
+
+            inp = [m for m in result.get("input_modalities", ["text"]) if m in valid_input]
+            out = [m for m in result.get("output_modalities", ["text"]) if m in valid_output]
+            pref = [p for p in result.get("prefer", []) if p in valid_prefer]
+            budget = result.get("budget_hint", "default")
+            if budget not in valid_budget:
+                budget = "default"
+            reasoning = result.get("reasoning", "")
+
+            if not inp:
+                inp = ["text"]
+            if not out:
+                out = ["text"]
+
+            # Calculate cost from usage
+            usage = data.get("usage", {})
+            tokens_in = usage.get("prompt_tokens", 0)
+            tokens_out = usage.get("completion_tokens", 0)
+            cost = float(usage.get("total_cost", 0))
+            if cost == 0:
+                # Estimate: Gemini Flash Lite is very cheap
+                cost = tokens_in * 0.000000075 + tokens_out * 0.0000003
+
+            ai_result = {
+                "input_modalities": inp,
+                "output_modalities": out,
+                "prefer": pref,
+                "budget_hint": budget,
+                "reasoning": reasoning,
+                "cost": cost,
+                "elapsed": elapsed,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+            }
+
+            _log(f"🤖 AI intent detection: {'→'.join(inp)}→{'→'.join(out)}"
+                 f" | prefer: {', '.join(pref) or 'none'}"
+                 f" | ${cost:.6f} | {elapsed:.1f}s", self.verbose)
+
+            return ai_result
+
+        except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            _log(f"⚠️  AI intent detection failed ({type(e).__name__}: {e}), using keyword fallback", self.verbose)
+            return None
+
+    def analyze_task(self, task: str, flags: Optional[Dict[str, Any]] = None,
+                     use_ai: bool = True) -> TaskRequirements:
+        """Analyze a task string to detect required modalities and capabilities.
+        
+        Stage 1 (if use_ai=True): AI-powered intent detection via cheap model.
+        Stage 2 / fallback: keyword-based heuristics.
+        User CLI flags always override both stages.
+        """
+        flags = flags or {}
+
+        # Start with keyword-based analysis as the base
+        reqs = self._keyword_analyze(task, flags)
+
+        # Try AI detection if enabled
+        if use_ai:
+            ai_result = self._ai_analyze(task)
+            if ai_result:
+                # AI detection succeeded — merge results
+                # AI-detected modalities (only if user didn't force via flags)
+                if not flags.get("input_modality") and not flags.get("image") and \
+                   not flags.get("video") and not flags.get("audio") and not flags.get("file"):
+                    reqs.input_modalities = sorted(set(ai_result["input_modalities"]))
+                
+                if not flags.get("output_modality"):
+                    reqs.output_modalities = sorted(set(ai_result["output_modalities"]))
+
+                # AI preferences (only if user didn't set --prefer)
+                if not flags.get("prefer"):
+                    ai_prefs = ai_result.get("prefer", [])
+                    reqs.prefer_coding = "coding" in ai_prefs
+                    reqs.prefer_reasoning = "reasoning" in ai_prefs
+                    reqs.prefer_fast = "fast" in ai_prefs
+
+                # AI budget hint (only if user didn't set --budget)
+                if not flags.get("budget") and ai_result.get("budget_hint", "default") != "default":
+                    reqs.budget = ai_result["budget_hint"]
 
         return reqs
 
@@ -462,7 +591,8 @@ class JobRunner:
             if key in kwargs:
                 flags[key] = kwargs[key]
 
-        reqs = self.analyze_task(task, flags)
+        use_ai = kwargs.get("use_ai", True)
+        reqs = self.analyze_task(task, flags, use_ai=use_ai)
 
         if self.verbose:
             _log(f"\n📋 Task Analysis:", True)
@@ -585,6 +715,8 @@ Examples:
                         help="System prompt to prepend")
     parser.add_argument("--model", type=str, default=None,
                         help="Force a specific model (skip selection)")
+    parser.add_argument("--no-ai-detect", action="store_true", dest="no_ai_detect",
+                        help="Skip AI intent detection, use keyword matching only (faster/offline)")
 
     return parser
 
@@ -638,6 +770,8 @@ def main():
         flags["max_input_cost"] = args.max_input_cost
     if args.budget:
         flags["budget"] = args.budget
+    # AI detection: enabled by default, disabled with --no-ai-detect
+    flags["use_ai"] = not args.no_ai_detect
 
     # Build media URLs
     media_urls: Dict[str, List[str]] = {}
