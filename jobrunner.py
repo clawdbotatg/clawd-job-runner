@@ -258,23 +258,19 @@ class JobRunner:
                 # Default: balance quality and cost
                 # Quality signal: higher cost usually = better model, but diminishing returns
                 # We want the sweet spot: capable but not extravagant
-                if cost_per_million >= 1.0:
-                    # Paid models: boost by quality tier
-                    if cost_per_million >= 10.0:
-                        score += 30  # Premium tier (Claude Opus, GPT-4.5, etc.)
-                    elif cost_per_million >= 2.0:
-                        score += 25  # High tier (Sonnet, GPT-4.1, etc.)
-                    elif cost_per_million >= 1.0:
-                        score += 15  # Mid tier
-                    # Within same tier, slightly prefer lower cost (tiebreaker)
-                    score -= min(cost_per_million * 0.1, 3)
-                    # Penalty for very expensive
-                    if cost_per_million > 20.0:
-                        score -= 10
-                elif cost_per_million > 0:
-                    score += 5  # Budget paid
+                # Default mode should NOT pick $2/M models for routine tasks
+                if cost_per_million == 0:
+                    score += 5   # Free: fine but not preferred
+                elif cost_per_million <= 0.5:
+                    score += 22  # Sweet spot: cheap but solid (Qwen, Gemini Flash, etc.)
+                elif cost_per_million <= 1.5:
+                    score += 18  # Mid: Haiku, Flash, etc.
+                elif cost_per_million <= 3.0:
+                    score += 10  # Upper mid: Sonnet range
+                elif cost_per_million <= 10.0:
+                    score += 4   # Expensive: only if task warrants it
                 else:
-                    score -= 10  # Free models rank lower in default mode
+                    score -= 5   # >$10/M: actively penalize for default mode
                 # Context bonus (moderate)
                 score += min(context_length / 100000, 10)
                 reasons.append(f"${cost_per_million:.2f}/M")
