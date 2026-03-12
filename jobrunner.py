@@ -215,7 +215,6 @@ class JobRunner:
         payload = {
             "model": AI_DETECT_MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
             "max_tokens": 150,
         }
         headers = {
@@ -234,6 +233,11 @@ class JobRunner:
 
             choice = data.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
+            # Strip markdown code fences if present
+            content = content.strip()
+            if content.startswith("```"):
+                content = "\n".join(content.split("\n")[1:])
+                content = content.split("```")[0].strip()
             result = json.loads(content)
 
             # Validate required fields
@@ -323,6 +327,7 @@ class JobRunner:
                 if not flags.get("budget") and ai_result.get("budget_hint", "default") != "default":
                     reqs.budget = ai_result["budget_hint"]
 
+        self._last_reqs = reqs
         return reqs
 
     def rank_models(self, models: List[Dict], reqs: TaskRequirements) -> List[ModelMatch]:
@@ -513,6 +518,8 @@ class JobRunner:
             "messages": messages,
         }
 
+        # Audio output requires streaming which isn't supported here — caught upstream
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -525,6 +532,18 @@ class JobRunner:
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 400:
+                err_body = ""
+                try:
+                    err_body = e.response.json().get("error", {}).get("message", "")
+                except Exception:
+                    pass
+                # Audio output models require special API format not supported here
+                if "audio" in err_body.lower() or "modality" in err_body.lower():
+                    raise RuntimeError(
+                        "Audio output models require a special API format not supported by standard chat completions.\n"
+                        "Try ElevenLabs, OpenAI TTS API, or Google Cloud TTS directly for text-to-speech."
+                    )
             raise RuntimeError(f"API request failed: {e}")
 
         # Parse response
@@ -616,10 +635,12 @@ class JobRunner:
 
         if not ranked:
             out_mods = reqs.output_modalities
-            if any(m in out_mods for m in ["video", "audio"]) and "image" not in out_mods:
-                _log(f"❌ No models on OpenRouter currently support {'/'.join(m for m in out_mods if m != 'text')} output generation.", True)
-                _log("   This is a catalog limitation — video/audio generation isn't available via OpenRouter yet.", True)
-                _log("   Try: Runway, Luma, Sora, or ElevenLabs directly for generative media.", True)
+            if "video" in out_mods:
+                _log("❌ No models on OpenRouter currently support video output generation.", True)
+                _log("   Try: Runway, Luma, or Sora directly for video generation.", True)
+            elif "audio" in out_mods:
+                _log("❌ Audio output generation (TTS) isn't reliably supported via OpenRouter's standard API.", True)
+                _log("   Try: ElevenLabs, OpenAI TTS API, or Google Cloud TTS directly.", True)
             else:
                 _log("❌ No models matched your requirements. Try relaxing constraints (budget, modality, context).", True)
             return None
@@ -643,6 +664,14 @@ class JobRunner:
         match = self.find_model(task, **kwargs)
         if not match:
             raise RuntimeError("No suitable model found for this task")
+
+        # Audio output via OpenRouter requires streaming — not supported
+        _reqs = getattr(self, '_last_reqs', None)
+        if _reqs and "audio" in getattr(_reqs, 'output_modalities', []):
+            raise RuntimeError(
+                "Audio output (TTS) via OpenRouter requires streaming which isn't supported here.\n"
+                "Try ElevenLabs, OpenAI TTS API, or Google Cloud TTS directly for text-to-speech."
+            )
 
         return self.execute(task, match.id, media_urls=media_urls, system_prompt=system_prompt)
 
