@@ -4,7 +4,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve real path even when called via symlink
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 
 # Load .env if present
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
@@ -33,4 +38,4 @@ if ! python3 -c "import requests" 2>/dev/null; then
     exit 1
 fi
 
-exec python3 "$SCRIPT_DIR/jobrunner.py" "$@"
+exec python3 -W ignore::Warning "$SCRIPT_DIR/jobrunner.py" "$@"

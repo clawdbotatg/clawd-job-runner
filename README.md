@@ -20,14 +20,32 @@ There are 400+ models on OpenRouter. You shouldn't have to know which one accept
 git clone https://github.com/clawdbotatg/clawd-job-runner.git
 cd clawd-job-runner
 pip install requests
+```
+
+Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys), then set it:
+
+```bash
 export OPENROUTER_API_KEY="sk-or-..."
+# Or drop it in a .env file in the repo dir:
+echo "OPENROUTER_API_KEY=sk-or-..." > .env
 ```
 
-Get an API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+**Make it a global command:**
 
-Or drop your key in a `.env` file:
+```bash
+# Add to your shell profile (~/.zshrc or ~/.bashrc):
+export PATH="$HOME/bin:$PATH"
+export OPENROUTER_API_KEY="sk-or-..."
+
+# Symlink so you can call it from anywhere:
+mkdir -p ~/bin
+ln -sf "$(pwd)/jobrunner.sh" ~/bin/jobrunner
 ```
-OPENROUTER_API_KEY=sk-or-v1-...
+
+Then just:
+
+```bash
+jobrunner "do this thing"
 ```
 
 ## Usage
